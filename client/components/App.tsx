@@ -21,10 +21,72 @@ interface RealtimeEvent {
   [key: string]: any;
 }
 
+type Mode = "interpreter" | "qa";
+
+const INSTRUCTIONS = {
+  interpreter: `你是專業的印尼語-中文雙向口譯員。
+
+【CRITICAL】語言判斷規則（按順序檢查）：
+1. 檢查是否包含印尼語關鍵詞（apa, berapa, bagaimana, ini, itu, saya, yang, tidak, ya）→ 判定為印尼語
+2. 檢查是否包含中文字（的、嗎、是、這、那、我、你、他、什麼）→ 判定為中文
+3. 若無法判斷，默認為印尼語
+
+【CRITICAL】翻譯規則：
+- 印尼語輸入 → 必須 100% 用繁體中文翻譯
+- 中文輸入 → 必須 100% 用印尼語翻譯
+- 絕對禁止：回答問題、補充資訊、解釋、混用語言
+
+【輸出格式】：
+- 只輸出翻譯結果
+- 單一語言輸出（不可混用）
+- 簡潔、準確、中立
+
+【範例】：
+用戶: "Bagaimana cuaca hari ini?"
+你: "今天天氣怎麼樣？"
+
+用戶: "今天很熱"
+你: "Hari ini sangat panas"
+
+用戶: "Berapa harga ini?"
+你: "這個多少錢？"
+
+用戶: "三百元"
+你: "Tiga ratus yuan"`,
+
+  qa: `你是印尼語-中文雙語智能助理。
+
+【CRITICAL】語言判斷規則（按順序檢查）：
+1. 檢查是否包含印尼語關鍵詞（apa, berapa, bagaimana, ini, itu, saya, yang, tidak, ya）→ 判定為印尼語
+2. 檢查是否包含中文字（的、嗎、是、這、那、我、你、他、什麼）→ 判定為中文
+3. 若無法判斷，默認為印尼語
+
+【CRITICAL】回答規則：
+- 印尼語問題 → 必須 100% 用繁體中文回答
+- 中文問題 → 必須 100% 用印尼語回答
+- 可以提供建議、補充資訊、詳細說明
+- 絕對禁止混用兩種語言
+
+【輸出格式】：
+- 單一語言輸出（不可混用）
+- 友善、專業、清晰
+
+【範例】：
+用戶: "Bagaimana cuaca hari ini?"
+你: "今天天氣晴朗，溫度大約 28 度，適合外出活動。"
+
+用戶: "今天很熱怎麼辦？"
+你: "Anda bisa minum lebih banyak air, memakai pakaian ringan, dan menghindari aktivitas di luar ruangan saat siang hari."
+
+用戶: "Berapa harga ini?"
+你: "這個產品是 350 元。如果買兩個有九折優惠。"`,
+};
+
 export default function App() {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [events, setEvents] = useState<RealtimeEvent[]>([]);
   const [dataChannel, setDataChannel] = useState<RTCDataChannel | null>(null);
+  const [mode, setMode] = useState<Mode>("interpreter");
   const peerConnection = useRef<RTCPeerConnection | null>(null);
   const audioElement = useRef<HTMLAudioElement | null>(null);
   const sessionConfigured = useRef(false);
@@ -197,6 +259,39 @@ export default function App() {
     });
   }
 
+  // 更新 session 模式
+  function updateSessionMode(newMode: Mode) {
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        instructions: INSTRUCTIONS[newMode],
+        voice: "sage",
+        input_audio_transcription: {
+          model: "whisper-1",
+        },
+        turn_detection: {
+          type: "server_vad",
+        },
+      },
+    };
+    sendClientEvent(sessionUpdate);
+  }
+
+  // 切換模式
+  async function toggleMode() {
+    const newMode: Mode = mode === "interpreter" ? "qa" : "interpreter";
+    setMode(newMode);
+
+    // 如果 session 正在運行，停止並重新啟動以清空對話歷史
+    if (isSessionActive) {
+      console.log("[mode] switching to", newMode, "- restarting session");
+      stopSession();
+      // 等待一小段時間確保完全停止
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await startSession();
+    }
+  }
+
   // Attach event listeners to the data channel when a new one is created
   useEffect(() => {
     if (!dataChannel) return;
@@ -226,21 +321,8 @@ export default function App() {
       currentAssistantTextRef.current = "";
 
       // 配置 session：啟用逐字稿和設定指令
-      const sessionUpdate = {
-        type: "session.update",
-        session: {
-          instructions: "你是一位專業的口譯員。使用者會用印尼語（Bahasa Indonesia）向你提問，你必須用繁體中文回答。請保持專業、清晰、友善的態度。",
-          voice: "sage",
-          input_audio_transcription: {
-            model: "whisper-1",
-          },
-          turn_detection: {
-            type: "server_vad",
-          },
-        },
-      };
-      sendClientEvent(sessionUpdate);
-      console.log("[realtime] session.update sent");
+      updateSessionMode(mode);
+      console.log("[realtime] session.update sent with mode:", mode);
     };
 
     dataChannel.addEventListener("message", handleMessage);
@@ -341,19 +423,34 @@ export default function App() {
         <div className="flex items-center gap-4 w-full mx-4">
           <img style={{ width: "24px" }} src={logo} />
           <h1 className="text-lg font-semibold">印尼勞工即時翻譯系統</h1>
+          <div className="ml-auto flex items-center gap-2">
+            <span className="text-sm text-gray-600">
+              {mode === "interpreter" ? "口譯模式" : "問答模式"}
+            </span>
+            <button
+              onClick={toggleMode}
+              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${
+                mode === "interpreter"
+                  ? "bg-blue-500 text-white hover:bg-blue-600"
+                  : "bg-green-500 text-white hover:bg-green-600"
+              }`}
+            >
+              {mode === "interpreter" ? "切換至問答" : "切換至口譯"}
+            </button>
+          </div>
         </div>
       </nav>
 
       <main className="absolute top-16 left-0 right-0 bottom-0 flex flex-col">
         {/* 上半部：左右分欄逐字稿 */}
-        <section className="flex-1 flex border-b border-gray-200">
+        <section className="flex-1 flex border-b border-gray-200 overflow-hidden">
           {/* 左側：User 印尼語 */}
-          <div className="flex-1 border-r border-gray-200">
+          <div className="flex-1 border-r border-gray-200 overflow-hidden">
             <TranscriptPanel transcripts={userTranscripts} side="user" />
           </div>
 
           {/* 右側：Assistant 中文 */}
-          <div className="flex-1">
+          <div className="flex-1 overflow-hidden">
             <TranscriptPanel
               transcripts={[
                 ...assistantTranscripts,
