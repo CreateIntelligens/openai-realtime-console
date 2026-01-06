@@ -67,6 +67,7 @@ export default function App() {
       throw new Error("Token response missing client_secret.value");
     }
     console.log("[realtime] token received");
+    const model = typeof data?.model === "string" ? data.model : realtimeModel;
 
     // Create a peer connection
     const pc = new RTCPeerConnection();
@@ -95,9 +96,9 @@ export default function App() {
     await pc.setLocalDescription(offer);
     await waitForIceGatheringComplete(pc);
 
-    console.log("[realtime] negotiating SDP", { model: realtimeModel });
+    console.log("[realtime] negotiating SDP", { model });
     const localSdp = pc.localDescription?.sdp || offer.sdp;
-    const sdpResponse = await fetch(`${realtimeBaseUrl}?model=${realtimeModel}`, {
+    const sdpResponse = await fetch(`${realtimeBaseUrl}?model=${model}`, {
       method: "POST",
       body: localSdp,
       headers: {
