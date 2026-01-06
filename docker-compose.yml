@@ -1,0 +1,22 @@
+services:
+  realtime-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: realtime-talk-ind-tw
+    container_name: realtime-talk-ind-tw
+    working_dir: /app
+    ports:
+      - "${PORT:-8908}:${PORT:-8908}"
+    environment:
+      - NODE_ENV=production
+      - HTTPS=true
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=${PORT:-8908}
+    restart: unless-stopped
+    volumes:
+      # 掛載整個專案（程式碼即時更新）
+      - .:/app
+      # 掛載 SSL 憑證
+      - ./certs:/app/certs
+    command: sh -c "sh ./scripts/generate-cert.sh && npm install --include=dev && npm run build && npm start"
