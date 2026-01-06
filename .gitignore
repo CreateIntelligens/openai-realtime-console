@@ -1,3 +1,13 @@
+csl.md
+.claude/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+firebase-debug.log
+docs/
+certs/
+
+
 # build output
 dist/
 
