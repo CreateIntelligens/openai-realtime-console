@@ -2,7 +2,11 @@ import { useState } from "react";
 import { CloudLightning, CloudOff, MessageSquare } from "react-feather";
 import Button from "./Button";
 
-function SessionStopped({ startSession }) {
+interface SessionStoppedProps {
+  startSession: () => void;
+}
+
+function SessionStopped({ startSession }: SessionStoppedProps) {
   const [isActivating, setIsActivating] = useState(false);
 
   function handleStartSession() {
@@ -25,7 +29,14 @@ function SessionStopped({ startSession }) {
   );
 }
 
-function SessionActive({ stopSession, sendTextMessage }) {
+interface SessionActiveProps {
+  stopSession: () => void;
+  sendTextMessage: (message: string) => void;
+  sendClientEvent?: (event: any) => void;
+  serverEvents?: any[];
+}
+
+function SessionActive({ stopSession, sendTextMessage }: SessionActiveProps) {
   const [message, setMessage] = useState("");
 
   function handleSendClientEvent() {
@@ -65,6 +76,15 @@ function SessionActive({ stopSession, sendTextMessage }) {
   );
 }
 
+interface SessionControlsProps {
+  startSession: () => void;
+  stopSession: () => void;
+  sendClientEvent: (event: any) => void;
+  sendTextMessage: (message: string) => void;
+  serverEvents: any[];
+  isSessionActive: boolean;
+}
+
 export default function SessionControls({
   startSession,
   stopSession,
@@ -72,7 +92,7 @@ export default function SessionControls({
   sendTextMessage,
   serverEvents,
   isSessionActive,
-}) {
+}: SessionControlsProps) {
   return (
     <div className="flex gap-4 border-t-2 border-gray-200 h-full rounded-md">
       {isSessionActive ? (

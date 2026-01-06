@@ -11,37 +11,49 @@ const app = express();
 app.use(express.text());
 const port = process.env.PORT || 8908;
 const apiKey = process.env.OPENAI_API_KEY;
-const useHttps = process.env.HTTPS !== 'false';
+const useHttps = process.env.HTTPS !== "false";
+const realtimeModel =
+  process.env.REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const realtimeVoice = process.env.REALTIME_VOICE || "sage";
 
-const sessionConfig = JSON.stringify({
-  session: {
-    type: "realtime",
-    model: "gpt-realtime",
-    audio: {
-      output: {
-        voice: "marin",
-      },
-    },
+const sessionConfig = {
+  model: realtimeModel,
+  voice: realtimeVoice,
+  input_audio_transcription: {
+    model: "whisper-1",
   },
-});
+};
 
 // API route for ephemeral token generation
 app.get("/token", async (req, res) => {
   try {
+    if (!apiKey) {
+      res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+      return;
+    }
+
     const response = await fetch(
-      "https://api.openai.com/v1/realtime/client_secrets",
+      "https://api.openai.com/v1/realtime/sessions",
       {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
+          "OpenAI-Beta": "realtime=v1",
         },
-        body: sessionConfig,
+        body: JSON.stringify(sessionConfig),
       },
     );
 
-    const data = await response.json();
-    res.json(data);
+    const raw = await response.text();
+    const data = raw ? JSON.parse(raw) : {};
+
+    if (!response.ok) {
+      res.status(response.status).json(data);
+      return;
+    }
+
+    res.json({ ...data, model: realtimeModel });
   } catch (error) {
     console.error("Token generation error:", error);
     res.status(500).json({ error: "Failed to generate token" });
@@ -56,10 +68,10 @@ app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "client/dist/client/index.html"));
 });
 
-if (useHttps && fs.existsSync('./certs/key.pem')) {
+if (useHttps && fs.existsSync("./certs/key.pem")) {
   const httpsOptions = {
-    key: fs.readFileSync('./certs/key.pem'),
-    cert: fs.readFileSync('./certs/cert.pem')
+    key: fs.readFileSync("./certs/key.pem"),
+    cert: fs.readFileSync("./certs/cert.pem"),
   };
 
   https.createServer(httpsOptions, app).listen(port, () => {
