@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { Maximize, Minimize } from "react-feather";
 import SessionControls from "./SessionControls";
 import TranscriptPanel from "./TranscriptPanel";
+import { INSTRUCTIONS, type Mode } from "../config/prompts";
 
 const logo = "/assets/openai-logomark.svg";
 const realtimeBaseUrl = "https://api.openai.com/v1/realtime";
@@ -21,76 +23,29 @@ interface RealtimeEvent {
   [key: string]: any;
 }
 
-type Mode = "interpreter" | "qa";
-
-const INSTRUCTIONS = {
-  interpreter: `你是專業的印尼語-中文雙向口譯員。
-
-【CRITICAL】語言判斷規則（按順序檢查）：
-1. 檢查是否包含印尼語關鍵詞（apa, berapa, bagaimana, ini, itu, saya, yang, tidak, ya）→ 判定為印尼語
-2. 檢查是否包含中文字（的、嗎、是、這、那、我、你、他、什麼）→ 判定為中文
-3. 若無法判斷，默認為印尼語
-
-【CRITICAL】翻譯規則：
-- 印尼語輸入 → 必須 100% 用繁體中文翻譯
-- 中文輸入 → 必須 100% 用印尼語翻譯
-- 絕對禁止：回答問題、補充資訊、解釋、混用語言
-
-【輸出格式】：
-- 只輸出翻譯結果
-- 單一語言輸出（不可混用）
-- 簡潔、準確、中立
-
-【範例】：
-用戶: "Bagaimana cuaca hari ini?"
-你: "今天天氣怎麼樣？"
-
-用戶: "今天很熱"
-你: "Hari ini sangat panas"
-
-用戶: "Berapa harga ini?"
-你: "這個多少錢？"
-
-用戶: "三百元"
-你: "Tiga ratus yuan"`,
-
-  qa: `你是印尼語-中文雙語智能助理。
-
-【CRITICAL】語言判斷規則（按順序檢查）：
-1. 檢查是否包含印尼語關鍵詞（apa, berapa, bagaimana, ini, itu, saya, yang, tidak, ya）→ 判定為印尼語
-2. 檢查是否包含中文字（的、嗎、是、這、那、我、你、他、什麼）→ 判定為中文
-3. 若無法判斷，默認為印尼語
-
-【CRITICAL】回答規則：
-- 印尼語問題 → 必須 100% 用繁體中文回答
-- 中文問題 → 必須 100% 用印尼語回答
-- 可以提供建議、補充資訊、詳細說明
-- 絕對禁止混用兩種語言
-
-【輸出格式】：
-- 單一語言輸出（不可混用）
-- 友善、專業、清晰
-
-【範例】：
-用戶: "Bagaimana cuaca hari ini?"
-你: "今天天氣晴朗，溫度大約 28 度，適合外出活動。"
-
-用戶: "今天很熱怎麼辦？"
-你: "Anda bisa minum lebih banyak air, memakai pakaian ringan, dan menghindari aktivitas di luar ruangan saat siang hari."
-
-用戶: "Berapa harga ini?"
-你: "這個產品是 350 元。如果買兩個有九折優惠。"`,
-};
+type Status = "idle" | "listening" | "processing" | "speaking";
 
 export default function App() {
   const [isSessionActive, setIsSessionActive] = useState(false);
-  const [events, setEvents] = useState<RealtimeEvent[]>([]);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isSwitchingMode, setIsSwitchingMode] = useState(false);
+  const isSwitchingModeRef = useRef(false); // 同步追蹤切換狀態
+  const [, setEvents] = useState<RealtimeEvent[]>([]);
   const [dataChannel, setDataChannel] = useState<RTCDataChannel | null>(null);
   const [mode, setMode] = useState<Mode>("interpreter");
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [status, setStatus] = useState<Status>("idle");
   const peerConnection = useRef<RTCPeerConnection | null>(null);
   const audioElement = useRef<HTMLAudioElement | null>(null);
+  const localMediaStream = useRef<MediaStream | null>(null);
   const sessionConfigured = useRef(false);
   const currentAssistantTextRef = useRef("");
+  const assistantTranscriptSourceRef = useRef<"audio" | "text" | null>(null);
+
+  // 控制機制：追蹤當前 response，確保一問一答
+  const currentResponseId = useRef<string | null>(null);
+  const isResponding = useRef(false);
 
   function waitForIceGatheringComplete(pc: RTCPeerConnection) {
     if (pc.iceGatheringState === "complete") {
@@ -114,80 +69,108 @@ export default function App() {
   const [currentAssistantText, setCurrentAssistantText] = useState("");
 
   async function startSession() {
-    console.log("[realtime] startSession");
-    // Get a session token for OpenAI Realtime API
-    const tokenResponse = await fetch("/token");
-    if (!tokenResponse.ok) {
-      const errorText = await tokenResponse.text();
-      console.log("[realtime] token error", errorText);
-      throw new Error(`Token request failed (${tokenResponse.status})`);
+    console.log("[realtime] startSession called, isSessionActive:", isSessionActive, "isSwitchingMode:", isSwitchingMode);
+    
+    // 允許在切換模式時重新連線，即使 isConnecting 為 true
+    if (isSessionActive && !isSwitchingMode) {
+      console.log("[realtime] session already active and not switching, returning");
+      return;
     }
-    const data = await tokenResponse.json();
-    const EPHEMERAL_KEY = data?.client_secret?.value ?? data?.value;
-    if (!EPHEMERAL_KEY) {
-      console.log("[realtime] token payload missing client_secret", data);
-      throw new Error("Token response missing client_secret.value");
-    }
-    console.log("[realtime] token received");
-    const model = typeof data?.model === "string" ? data.model : realtimeModel;
-
-    // Create a peer connection
-    const pc = new RTCPeerConnection();
-
-    // Set up to play remote audio from the model
-    audioElement.current = document.createElement("audio");
-    audioElement.current.autoplay = true;
-    pc.ontrack = (e) => {
-      if (audioElement.current) {
-        audioElement.current.srcObject = e.streams[0];
+    
+    setIsConnecting(true);
+    console.log("[realtime] startSession proceeding...");
+    try {
+      // Get a session token for OpenAI Realtime API
+      const tokenResponse = await fetch("/token");
+      if (!tokenResponse.ok) {
+        const errorText = await tokenResponse.text();
+        console.log("[realtime] token error", errorText);
+        throw new Error(`Token request failed (${tokenResponse.status})`);
       }
-    };
+      const data = await tokenResponse.json();
+      const EPHEMERAL_KEY = data?.client_secret?.value ?? data?.value;
+      if (!EPHEMERAL_KEY) {
+        console.log("[realtime] token payload missing client_secret", data);
+        throw new Error("Token response missing client_secret.value");
+      }
+      console.log("[realtime] token received");
+      const model = typeof data?.model === "string" ? data.model : realtimeModel;
 
-    // Add local audio track for microphone input in the browser
-    const ms = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-    });
-    pc.addTrack(ms.getTracks()[0], ms);
+      // Create a peer connection
+      const pc = new RTCPeerConnection();
 
-    // Set up data channel for sending and receiving events
-    const dc = pc.createDataChannel("oai-events");
-    setDataChannel(dc);
+      // Set up to play remote audio from the model
+      audioElement.current = document.createElement("audio");
+      audioElement.current.autoplay = true;
+      pc.ontrack = (e) => {
+        if (audioElement.current) {
+          audioElement.current.srcObject = e.streams[0];
+        }
+      };
 
-    // Start the session using the Session Description Protocol (SDP)
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await waitForIceGatheringComplete(pc);
+      // Add local audio track for microphone input in the browser
+      const ms = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
+      localMediaStream.current = ms;
 
-    console.log("[realtime] negotiating SDP", { model });
-    const localSdp = pc.localDescription?.sdp || offer.sdp;
-    const sdpResponse = await fetch(`${realtimeBaseUrl}?model=${model}`, {
-      method: "POST",
-      body: localSdp,
-      headers: {
-        Authorization: `Bearer ${EPHEMERAL_KEY}`,
-        "Content-Type": "application/sdp",
-        "OpenAI-Beta": "realtime=v1",
-      },
-    });
+      // 預設靜音，需要按住才會錄音
+      ms.getAudioTracks().forEach(track => {
+        track.enabled = false;
+      });
+      setIsMicMuted(true);
 
-    if (!sdpResponse.ok) {
-      const errorText = await sdpResponse.text();
-      console.log("[realtime] SDP error", errorText);
-      throw new Error(`SDP request failed (${sdpResponse.status})`);
+      pc.addTrack(ms.getTracks()[0], ms);
+
+      // Set up data channel for sending and receiving events
+      const dc = pc.createDataChannel("oai-events");
+      setDataChannel(dc);
+
+      // Start the session using the Session Description Protocol (SDP)
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGatheringComplete(pc);
+
+      console.log("[realtime] negotiating SDP", { model });
+      const localSdp = pc.localDescription?.sdp || offer.sdp;
+      const sdpResponse = await fetch(`${realtimeBaseUrl}?model=${model}`, {
+        method: "POST",
+        body: localSdp,
+        headers: {
+          Authorization: `Bearer ${EPHEMERAL_KEY}`,
+          "Content-Type": "application/sdp",
+          "OpenAI-Beta": "realtime=v1",
+        },
+      });
+
+      if (!sdpResponse.ok) {
+        const errorText = await sdpResponse.text();
+        console.log("[realtime] SDP error", errorText);
+        throw new Error(`SDP request failed (${sdpResponse.status})`);
+      }
+
+      const sdp = await sdpResponse.text();
+      const answer: RTCSessionDescriptionInit = { type: "answer", sdp };
+      await pc.setRemoteDescription(answer);
+
+      peerConnection.current = pc;
+      console.log("[realtime] session started");
+    } catch (err) {
+      console.error("[realtime] failed to start session", err);
+      setIsConnecting(false);
     }
-
-    const sdp = await sdpResponse.text();
-    const answer: RTCSessionDescriptionInit = { type: "answer", sdp };
-    await pc.setRemoteDescription(answer);
-
-    peerConnection.current = pc;
-    console.log("[realtime] session started");
   }
 
   // Stop current session, clean up peer connection and data channel
   function stopSession() {
     sessionConfigured.current = false;
     currentAssistantTextRef.current = "";
+
+    // 重置控制狀態
+    isResponding.current = false;
+    currentResponseId.current = null;
+    console.log("[control] session stopped, control state reset");
+
     if (dataChannel) {
       dataChannel.close();
     }
@@ -197,6 +180,11 @@ export default function App() {
         sender.track.stop();
       }
     });
+
+    if (localMediaStream.current) {
+        localMediaStream.current.getTracks().forEach(track => track.stop());
+        localMediaStream.current = null;
+    }
 
     if (peerConnection.current) {
       peerConnection.current.close();
@@ -248,14 +236,31 @@ export default function App() {
 
     sendClientEvent(event);
     requestAssistantResponse();
+
+    // Manually add to transcript for immediate feedback
+    setUserTranscripts((prev) => [
+      ...prev,
+      { text: message, timestamp: new Date().toLocaleTimeString() },
+    ]);
   }
 
   function requestAssistantResponse() {
+    const requestId = crypto.randomUUID().slice(0, 8);
+    console.log(`[control] ⚡ requesting response #${requestId}, mode=${mode}`);
     sendClientEvent({
       type: "response.create",
       response: {
         modalities: ["text", "audio"],
+        // 不限制 token，讓翻譯自然完整
       },
+    });
+  }
+
+  // 取消 response（強制停止 LLM）
+  function cancelResponse(responseId: string) {
+    console.log("[control] canceling response", responseId);
+    sendClientEvent({
+      type: "response.cancel",
     });
   }
 
@@ -268,28 +273,123 @@ export default function App() {
         voice: "sage",
         input_audio_transcription: {
           model: "whisper-1",
+          language: "id", // 印尼語 ISO-639-1，提高辨識準確度
         },
         turn_detection: {
           type: "server_vad",
+          threshold: 0.5,
+          silence_duration_ms: 1200, // 1.2秒靜音才觸發
+          prefix_padding_ms: 300,
         },
       },
     };
     sendClientEvent(sessionUpdate);
   }
 
-  // 切換模式
-  async function toggleMode() {
-    const newMode: Mode = mode === "interpreter" ? "qa" : "interpreter";
-    setMode(newMode);
+  // 切換模式 (指定模式)
+  async function handleModeChange(targetMode: Mode) {
+    if (mode === targetMode) return;
+    
+    console.log("[mode] handleModeChange called, target:", targetMode, "current:", mode);
+    setMode(targetMode);
 
     // 如果 session 正在運行，停止並重新啟動以清空對話歷史
     if (isSessionActive) {
-      console.log("[mode] switching to", newMode, "- restarting session");
+      isSwitchingModeRef.current = true; // 同步設定
+      setIsSwitchingMode(true);
+      console.log("[mode] switching to", targetMode, "- restarting session");
+      
+      // 超時保護：5秒後強制解除切換狀態
+      const timeout = setTimeout(() => {
+        console.error("[mode] switch timeout! Force reset.");
+        isSwitchingModeRef.current = false;
+        setIsSwitchingMode(false);
+      }, 5000);
+      
       stopSession();
+      console.log("[mode] stopSession completed, waiting 500ms...");
       // 等待一小段時間確保完全停止
       await new Promise(resolve => setTimeout(resolve, 500));
-      await startSession();
+      console.log("[mode] wait completed, calling startSession()...");
+      try {
+        await startSession();
+        console.log("[mode] startSession completed successfully");
+        clearTimeout(timeout);
+        isSwitchingModeRef.current = false; // 完成後清除
+      } catch (err) {
+        console.error("[mode] failed to restart session:", err);
+        clearTimeout(timeout);
+        isSwitchingModeRef.current = false;
+        setIsSwitchingMode(false);
+      }
+    } else {
+      console.log("[mode] session not active, just updating mode");
     }
+  }
+
+  function toggleFullScreen() {
+    if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().then(() => setIsFullScreen(true));
+    } else {
+        if (document.exitFullscreen) {
+            document.exitFullscreen().then(() => setIsFullScreen(false));
+        }
+    }
+  }
+
+  // 監聽全螢幕變化 (例如按 Esc 退出)
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+        setIsFullScreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+
+  // 自動啟動 session（頁面載入時）
+  useEffect(() => {
+    console.log("[auto-start] initializing session on page load");
+    startSession().catch((err) => {
+      console.error("[auto-start] failed to start session:", err);
+    });
+  }, []);
+
+  function handleMute(mute: boolean) {
+    if (localMediaStream.current) {
+        localMediaStream.current.getAudioTracks().forEach(track => {
+            track.enabled = !mute;
+        });
+        setIsMicMuted(mute);
+
+        // 同步更新狀態指示燈
+        setStatus(currentStatus => {
+          if (currentStatus === "processing" || currentStatus === "speaking") {
+            return currentStatus;
+          }
+          return "idle";
+        });
+    }
+  }
+
+  // 清除逐字稿
+  function clearTranscripts() {
+    setUserTranscripts([]);
+    setAssistantTranscripts([]);
+    setCurrentAssistantText("");
+    currentAssistantTextRef.current = "";
+
+    // 重置控制狀態
+    isResponding.current = false;
+    currentResponseId.current = null;
+    console.log("[control] transcripts cleared, control state reset");
+  }
+
+  // 重新連線
+  async function reconnect() {
+    console.log("[reconnect] restarting session");
+    stopSession();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await startSession();
   }
 
   // Attach event listeners to the data channel when a new one is created
@@ -305,6 +405,9 @@ export default function App() {
       console.log("[realtime] event", event.type, event);
       setEvents((prev) => [event, ...prev]);
 
+      // 更新狀態指示燈
+      updateStatus(event);
+
       // 處理逐字稿事件
       handleTranscriptEvent(event);
     };
@@ -314,9 +417,12 @@ export default function App() {
       sessionConfigured.current = true;
 
       setIsSessionActive(true);
+      setIsConnecting(false);
+      setIsSwitchingMode(false);
       setEvents([]);
       setUserTranscripts([]);
       setAssistantTranscripts([]);
+
       setCurrentAssistantText("");
       currentAssistantTextRef.current = "";
 
@@ -337,33 +443,91 @@ export default function App() {
     };
   }, [dataChannel]);
 
+  // 更新狀態指示燈
+  function updateStatus(event: RealtimeEvent) {
+    // 使用者開始說話
+    if (event.type === "input_audio_buffer.speech_started") {
+      console.log("[VAD] speech started");
+      setStatus("listening");
+    }
+    // 使用者停止說話，開始處理
+    else if (event.type === "input_audio_buffer.speech_stopped") {
+      console.log("[VAD] speech stopped");
+      setStatus("processing");
+    }
+    // AI 開始回覆
+    else if (event.type === "response.audio.delta" || event.type === "response.audio_transcript.delta") {
+      setStatus("speaking");
+    }
+    // AI 回覆完成
+    else if (event.type === "response.audio.done" || event.type === "response.done") {
+      // 回覆完成後，根據麥克風狀態決定下一個狀態
+      // 如果麥克風是靜音的，保持 idle；否則回到 listening
+      setStatus((prevStatus) => {
+        // 只有在回覆中才改變狀態，避免覆蓋其他狀態
+        if (prevStatus === "speaking") {
+          return isMicMuted ? "idle" : "listening";
+        }
+        return prevStatus;
+      });
+    }
+    // Session 開始 - 不自動設為 listening，保持 idle 直到用戶按住說話
+    else if (event.type === "session.created" || event.type === "session.updated") {
+      // 不做任何事，保持當前狀態（應該是 idle）
+    }
+  }
+
   // 處理逐字稿事件
   function handleTranscriptEvent(event: RealtimeEvent) {
     const timestamp = event.timestamp || new Date().toLocaleTimeString();
 
     // User 印尼語逐字稿完成
-    if (
-      event.type === "conversation.item.input_audio_transcription.completed" ||
-      event.type === "conversation.item.created" ||
-      event.type === "conversation.item.updated"
-    ) {
-      const content = Array.isArray(event.item?.content) ? event.item?.content : [];
-      const contentTranscript =
-        content.find((item: any) => typeof item?.transcript === "string")?.transcript ||
-        content.find((item: any) => typeof item?.text === "string")?.text;
-      const transcript =
-        event.transcript ||
-        event.item?.input_audio_transcription?.transcript ||
-        contentTranscript ||
-        event.item?.input_audio_transcription?.text ||
-        "";
+    // 只處理 input_audio_transcription.completed 避免重複
+    if (event.type === "conversation.item.input_audio_transcription.completed") {
+      const transcript = event.transcript || "";
       if (transcript) {
         console.log("[transcript] user completed", transcript);
         setUserTranscripts((prev) => [
           ...prev,
           { text: transcript, timestamp },
         ]);
+
+        // 【控制機制】只在口譯模式下執行一問一答控制
+        if (mode === "interpreter") {
+          console.log("[control] user input received, preparing response control");
+          currentResponseId.current = null; // 重置，允許新的第一個 response
+          isResponding.current = false;
+        }
+
         requestAssistantResponse();
+      }
+    }
+
+    // 【控制機制】追蹤 response 開始
+    if (event.type === "response.created") {
+      const responseId = event.response?.id || event.event_id || "";
+
+      // 口譯模式下，嚴格執行一問一答
+      if (mode === "interpreter") {
+        console.log("[control] response.created", responseId, "currentId:", currentResponseId.current);
+
+        // 如果這是第一個 response，記錄並允許
+        if (!currentResponseId.current) {
+          console.log("[control] ✓ First response, allowing:", responseId);
+          currentResponseId.current = responseId;
+          isResponding.current = true;
+        }
+        // 如果已經有 response 在進行中或已完成，立即取消這個新的
+        else {
+          console.log("[control] ✗ BLOCKING second response! Canceling:", responseId);
+          // 立即發送取消指令
+          sendClientEvent({
+            type: "response.cancel",
+          });
+          return;
+        }
+      } else {
+        console.log("[control] response.created (Q&A mode)", responseId);
       }
     }
 
@@ -374,6 +538,18 @@ export default function App() {
       event.type === "response.output_audio_transcript.delta" ||
       event.type === "response.output_text.delta"
     ) {
+      const source =
+        event.type === "response.audio_transcript.delta" ||
+        event.type === "response.output_audio_transcript.delta"
+          ? "audio"
+          : "text";
+      if (
+        assistantTranscriptSourceRef.current &&
+        assistantTranscriptSourceRef.current !== source
+      ) {
+        return;
+      }
+      assistantTranscriptSourceRef.current = source;
       const delta =
         event.delta ||
         event.response?.audio_transcript?.delta ||
@@ -382,11 +558,26 @@ export default function App() {
         event.output_text?.delta ||
         "";
       if (delta) {
+        console.log("[transcript] assistant delta:", delta);
         setCurrentAssistantText((prev) => {
           const next = prev + delta;
           currentAssistantTextRef.current = next;
           return next;
         });
+      }
+    }
+
+    // 【控制機制】Assistant 回覆完成，重置狀態
+    if (event.type === "response.done") {
+      const responseId = event.response?.id || "";
+      console.log("[control] response.done", responseId);
+
+      // 口譯模式：第一個 response 完成後，標記為完成但不重置 currentResponseId
+      // 這樣可以阻止後續的 response
+      if (mode === "interpreter") {
+        isResponding.current = false;
+        // 注意：不重置 currentResponseId，保持阻擋狀態
+        console.log("[control] First response finished, will block any new responses");
       }
     }
 
@@ -397,6 +588,18 @@ export default function App() {
       event.type === "response.output_audio_transcript.done" ||
       event.type === "response.output_text.done"
     ) {
+      const source =
+        event.type === "response.audio_transcript.done" ||
+        event.type === "response.output_audio_transcript.done"
+          ? "audio"
+          : "text";
+      if (
+        assistantTranscriptSourceRef.current &&
+        assistantTranscriptSourceRef.current !== source
+      ) {
+        return;
+      }
+      assistantTranscriptSourceRef.current = source;
       const transcript =
         event.transcript ||
         event.text ||
@@ -406,50 +609,97 @@ export default function App() {
         event.output_text?.text ||
         currentAssistantTextRef.current;
       if (transcript) {
-        console.log("[transcript] assistant done", transcript);
+        console.log("[transcript] assistant done:", transcript);
         setAssistantTranscripts((prev) => [
           ...prev,
           { text: transcript, timestamp },
         ]);
         setCurrentAssistantText("");
         currentAssistantTextRef.current = "";
+        assistantTranscriptSourceRef.current = null;
       }
     }
   }
 
   return (
     <>
-      <nav className="absolute top-0 left-0 right-0 h-16 flex items-center bg-white border-b border-gray-200">
-        <div className="flex items-center gap-4 w-full mx-4">
+      <nav className="absolute top-0 left-0 right-0 h-14 flex items-center z-10 bg-white border-b border-slate-200 shadow-sm">
+        <div className="flex items-center gap-3 w-full px-4">
           <img style={{ width: "24px" }} src={logo} />
-          <h1 className="text-lg font-semibold">印尼勞工即時翻譯系統</h1>
-          <div className="ml-auto flex items-center gap-2">
-            <span className="text-sm text-gray-600">
-              {mode === "interpreter" ? "口譯模式" : "問答模式"}
-            </span>
+          <h1 className="text-base font-semibold text-slate-800 hidden sm:block">
+            印尼語即時翻譯
+          </h1>
+
+          {/* Status indicator */}
+          {isSessionActive && (
+            <div className="flex items-center gap-3 px-6 py-2 rounded-full bg-slate-100 shadow-sm border border-slate-200">
+              <div
+                className={`w-4 h-4 rounded-full ${
+                  status === "listening"
+                    ? "bg-emerald-500 animate-pulse shadow-[0_0_10px_rgba(16,185,129,0.5)]"
+                    : status === "processing"
+                    ? "bg-amber-500 animate-pulse shadow-[0_0_10px_rgba(245,158,11,0.5)]"
+                    : status === "speaking"
+                    ? "bg-blue-500 animate-pulse shadow-[0_0_10px_rgba(59,130,246,0.5)]"
+                    : "bg-slate-400"
+                }`}
+              />
+              <span className="text-lg font-bold text-slate-700">
+                {status === "listening"
+                  ? "聆聽中"
+                  : status === "processing"
+                  ? "處理中"
+                  : status === "speaking"
+                  ? "回覆中"
+                  : "待機"}
+              </span>
+            </div>
+          )}
+
+          <div className="ml-auto flex items-center gap-3">
+            <div className="flex bg-slate-200 rounded-full p-1.5 border border-slate-300 shadow-inner">
+              <button
+                onClick={() => handleModeChange("interpreter")}
+                className={`px-5 py-2 rounded-full text-base font-bold transition-all ${
+                  mode === "interpreter"
+                    ? "bg-white text-emerald-600 shadow-md ring-1 ring-black/5"
+                    : "text-slate-500 hover:text-slate-700 hover:bg-slate-200/50"
+                }`}
+              >
+                口譯模式
+              </button>
+              <button
+                onClick={() => handleModeChange("qa")}
+                className={`px-5 py-2 rounded-full text-base font-bold transition-all ${
+                  mode === "qa"
+                    ? "bg-white text-blue-600 shadow-md ring-1 ring-black/5"
+                    : "text-slate-500 hover:text-slate-700 hover:bg-slate-200/50"
+                }`}
+              >
+                問答模式
+              </button>
+            </div>
+            
             <button
-              onClick={toggleMode}
-              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${
-                mode === "interpreter"
-                  ? "bg-blue-500 text-white hover:bg-blue-600"
-                  : "bg-green-500 text-white hover:bg-green-600"
-              }`}
+              onClick={toggleFullScreen}
+              className="p-3 rounded-full text-slate-500 hover:bg-slate-100 transition-colors ml-2"
+              title="全螢幕"
             >
-              {mode === "interpreter" ? "切換至問答" : "切換至口譯"}
+              {isFullScreen ? <Minimize size={24} /> : <Maximize size={24} />}
             </button>
           </div>
         </div>
       </nav>
 
-      <main className="absolute top-16 left-0 right-0 bottom-0 flex flex-col">
-        {/* 上半部：左右分欄逐字稿 */}
-        <section className="flex-1 flex border-b border-gray-200 overflow-hidden">
-          {/* 左側：User 印尼語 */}
-          <div className="flex-1 border-r border-gray-200 overflow-hidden">
+      <main className="absolute top-14 left-0 right-0 bottom-0 flex flex-col bg-slate-100">
+        {/* Chat transcript area */}
+        <section className="flex-1 flex overflow-hidden">
+          {/* Left panel: User Indonesian */}
+          <div className="flex-1 overflow-hidden border-r border-slate-200">
             <TranscriptPanel transcripts={userTranscripts} side="user" />
           </div>
 
-          {/* 右側：Assistant 中文 */}
+          {/* Right panel: Assistant Chinese */}
           <div className="flex-1 overflow-hidden">
             <TranscriptPanel
               transcripts={[
@@ -464,15 +714,18 @@ export default function App() {
           </div>
         </section>
 
-        {/* 下半部：控制面板 */}
-        <section className="h-32 p-4 bg-gray-50">
+        {/* Control panel */}
+        <section className="h-44 shrink-0">
           <SessionControls
             startSession={startSession}
-            stopSession={stopSession}
-            sendClientEvent={sendClientEvent}
             sendTextMessage={sendTextMessage}
-            serverEvents={events}
             isSessionActive={isSessionActive}
+            isConnecting={isConnecting}
+            isSwitchingMode={isSwitchingMode}
+            onReconnect={reconnect}
+            onClear={clearTranscripts}
+            setMuted={handleMute}
+            isMuted={isMicMuted}
           />
         </section>
       </main>
