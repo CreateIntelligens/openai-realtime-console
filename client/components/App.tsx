@@ -4,7 +4,6 @@ import SessionControls from "./SessionControls";
 import TranscriptPanel from "./TranscriptPanel";
 import { INSTRUCTIONS, type Mode } from "../config/prompts";
 
-const logo = "/assets/openai-logomark.svg";
 const realtimeBaseUrl = "https://api.openai.com/v1/realtime";
 const realtimeModel = "gpt-4o-realtime-preview-2024-12-17";
 
@@ -69,10 +68,10 @@ export default function App() {
   const [currentAssistantText, setCurrentAssistantText] = useState("");
 
   async function startSession() {
-    console.log("[realtime] startSession called, isSessionActive:", isSessionActive, "isSwitchingMode:", isSwitchingMode);
-    
-    // 允許在切換模式時重新連線，即使 isConnecting 為 true
-    if (isSessionActive && !isSwitchingMode) {
+    console.log("[realtime] startSession called, isSessionActive:", isSessionActive, "isSwitchingModeRef:", isSwitchingModeRef.current);
+
+    // 允許在切換模式時重新連線
+    if (isSessionActive && !isSwitchingModeRef.current) {
       console.log("[realtime] session already active and not switching, returning");
       return;
     }
@@ -315,7 +314,8 @@ export default function App() {
         await startSession();
         console.log("[mode] startSession completed successfully");
         clearTimeout(timeout);
-        isSwitchingModeRef.current = false; // 完成後清除
+        isSwitchingModeRef.current = false;
+        setIsSwitchingMode(false); // 確保 state 也被清除
       } catch (err) {
         console.error("[mode] failed to restart session:", err);
         clearTimeout(timeout);
@@ -491,44 +491,16 @@ export default function App() {
           ...prev,
           { text: transcript, timestamp },
         ]);
-
-        // 【控制機制】只在口譯模式下執行一問一答控制
-        if (mode === "interpreter") {
-          console.log("[control] user input received, preparing response control");
-          currentResponseId.current = null; // 重置，允許新的第一個 response
-          isResponding.current = false;
-        }
-
-        requestAssistantResponse();
+        // 注意：使用 server_vad 模式時，OpenAI 會自動觸發 response
+        // 不需要手動呼叫 requestAssistantResponse()
+        // 這個事件只用來更新 UI 顯示逐字稿
       }
     }
 
-    // 【控制機制】追蹤 response 開始
+    // 追蹤 response 開始（用於 debug）
     if (event.type === "response.created") {
       const responseId = event.response?.id || event.event_id || "";
-
-      // 口譯模式下，嚴格執行一問一答
-      if (mode === "interpreter") {
-        console.log("[control] response.created", responseId, "currentId:", currentResponseId.current);
-
-        // 如果這是第一個 response，記錄並允許
-        if (!currentResponseId.current) {
-          console.log("[control] ✓ First response, allowing:", responseId);
-          currentResponseId.current = responseId;
-          isResponding.current = true;
-        }
-        // 如果已經有 response 在進行中或已完成，立即取消這個新的
-        else {
-          console.log("[control] ✗ BLOCKING second response! Canceling:", responseId);
-          // 立即發送取消指令
-          sendClientEvent({
-            type: "response.cancel",
-          });
-          return;
-        }
-      } else {
-        console.log("[control] response.created (Q&A mode)", responseId);
-      }
+      console.log("[control] response.created", responseId);
     }
 
     // Assistant 中文逐字稿 streaming
@@ -567,18 +539,10 @@ export default function App() {
       }
     }
 
-    // 【控制機制】Assistant 回覆完成，重置狀態
+    // Assistant 回覆完成（用於 debug）
     if (event.type === "response.done") {
       const responseId = event.response?.id || "";
       console.log("[control] response.done", responseId);
-
-      // 口譯模式：第一個 response 完成後，標記為完成但不重置 currentResponseId
-      // 這樣可以阻止後續的 response
-      if (mode === "interpreter") {
-        isResponding.current = false;
-        // 注意：不重置 currentResponseId，保持阻擋狀態
-        console.log("[control] First response finished, will block any new responses");
-      }
     }
 
     // Assistant 中文逐字稿完成
@@ -625,8 +589,7 @@ export default function App() {
     <>
       <nav className="absolute top-0 left-0 right-0 h-14 flex items-center z-10 bg-white border-b border-slate-200 shadow-sm">
         <div className="flex items-center gap-3 w-full px-4">
-          <img style={{ width: "24px" }} src={logo} />
-          <h1 className="text-base font-semibold text-slate-800 hidden sm:block">
+          <h1 className="text-base font-semibold text-slate-800">
             印尼語即時翻譯
           </h1>
 
